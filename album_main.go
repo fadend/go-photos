@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"flag"
 	"fmt"
 	"github.com/nfnt/resize"
@@ -11,12 +12,16 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
 
-const MaxThumbnailWidth = 300
-const MaxThumbnailHeight = 400
+const (
+	MaxThumbnailWidth  = 300
+	MaxThumbnailHeight = 400
+	UnknownDateString  = "???"
+)
 
 var HeadTemplate *template.Template = template.Must(template.New("head").Parse(`<!DOCTYPE html>
 <html lang='en'>
@@ -33,8 +38,11 @@ var HeadTemplate *template.Template = template.Must(template.New("head").Parse(`
 <h1>{{.Name}}</h1>
 <p>{{.NumImages}} images in this album and subalbums.</p>`))
 
+var SubAlbumTemplate *template.Template = template.Must(template.New("subalbum").Parse(`
+<a href="{{.Name}}/index.html">{{.Name}}</a> ({{.NumImages}} images, {{.DateRangeString}})`))
+
 var ImgTemplate *template.Template = template.Must(template.New("img").Parse(`<a class="img-link" href="{{.Name}}">
-  <img src="{{.Thumbnail.Name}}" alt="{{.Name}}"
+  <img src="{{.Thumbnail.Name}}" alt="{{.Name}}" title="{{.TimeString}} {{.Name}}"
     width="{{.Thumbnail.Width}}" height="{{.Thumbnail.Height}}">
 </a>`))
 
@@ -74,7 +82,18 @@ func timeToString(t time.Time) string {
 	if !t.Equal(FutureTime) && !t.IsZero() {
 		return fmt.Sprintf("%+v", t)
 	}
-	return "(time n/a)"
+	return "???"
+}
+
+func dateToString(t time.Time) string {
+	if !t.Equal(FutureTime) && !t.IsZero() {
+		return t.Format(time.DateOnly)
+	}
+	return UnknownDateString
+}
+
+func (i Image) TimeString() string {
+	return timeToString(i.DateTime)
 }
 
 func (a Album) String() string {
@@ -82,6 +101,15 @@ func (a Album) String() string {
 	maxStr := timeToString(a.MaxTime)
 	return fmt.Sprintf(
 		"Album %s has %d image(s) from between %s and %s", a.Name, a.NumImages, minStr, maxStr)
+}
+
+func (a Album) DateRangeString() string {
+	minStr := dateToString(a.MinTime)
+	maxStr := dateToString(a.MaxTime)
+	if minStr != maxStr {
+		return minStr + " - " + maxStr
+	}
+	return minStr
 }
 
 func isImageFile(path string) bool {
@@ -124,6 +152,7 @@ func createThumbnail(imageBytes []byte, imageName string, outputDir string) (Thu
 	return Thumbnail{Name: thumbnailName, Width: bounds.Dx(), Height: bounds.Dy()}, nil
 }
 
+// processImage generates a thumbnail, extracts EXIF info, and copies the original to outputDir.
 func processImage(inputDir string, imageName string, outputDir string, ch chan Image) {
 	result := Image{Name: imageName}
 	imagePath := filepath.Join(inputDir, imageName)
@@ -152,6 +181,7 @@ func processImage(inputDir string, imageName string, outputDir string, ch chan I
 	ch <- result
 }
 
+// processImages generates thumbnails, extracts EXIF info, and copies originals to outputDir.
 func processImages(inputDir string, imageNames []string, outputDir string) []Image {
 	n := len(imageNames)
 	result := make([]Image, n)
@@ -165,12 +195,59 @@ func processImages(inputDir string, imageNames []string, outputDir string) []Ima
 	return result
 }
 
-func writeHtml(album Album, subAlbums []Album, images []Image, outputDir string) {
-	var buf bytes.Buffer
-	HeadTemplate.Execute(&buf, album)
-	for _, image := range images {
-		ImgTemplate.Execute(&buf, image)
+func dateStringToHeaderText(date string) string {
+	if date != UnknownDateString {
+		return date
 	}
+	return "Unknown Date"
+}
+
+func dateStringToId(date string) string {
+	if date != UnknownDateString {
+		return date
+	}
+	return "unknown-date"
+}
+
+// writeHtml creates "index.html" in outputDir for the given album.
+// Assumes that images and subalbums are sorted increasing by time or min time.
+func writeHtml(album Album, subAlbums []Album, images []Image, outputDir string) {
+	// TODO: push more of this logic into the Templates themselves.
+	var buf bytes.Buffer
+	if err := HeadTemplate.Execute(&buf, album); err != nil {
+		log.Fatalf("Failed to execute head template for album %s: %+v", album.Name, err)
+	}
+	for _, subAlbum := range subAlbums {
+		if err := SubAlbumTemplate.Execute(&buf, subAlbum); err != nil {
+			log.Fatalf("Failed to execute template for subalbum %s: %+v", subAlbum.Name, err)
+		}
+		buf.WriteString("<br>")
+	}
+	var dates []string
+	knownDates := make(map[string]bool)
+
+	var imageBuf bytes.Buffer
+	for _, image := range images {
+		date := dateToString(image.DateTime)
+		if !knownDates[date] {
+			dates = append(dates, date)
+			knownDates[date] = true
+			fmt.Fprintf(&imageBuf, `<h2 id="%s">%s</h2>`, dateStringToId(date), dateStringToHeaderText(date))
+		}
+		if err := ImgTemplate.Execute(&imageBuf, image); err != nil {
+			log.Fatalf("Failed to execute template for image %s: %+v", image.Name, err)
+		}
+	}
+	if len(dates) > 1 {
+		fmt.Fprint(&buf, "Dates: ")
+		for i, date := range dates {
+			if i != 0 {
+				buf.WriteString(", ")
+			}
+			fmt.Fprintf(&buf, `<a href="#%s">%s</a>`, dateStringToId(date), dateStringToHeaderText(date))
+		}
+	}
+	buf.Write(imageBuf.Bytes())
 	htmlFile := filepath.Join(outputDir, "index.html")
 	if err := os.WriteFile(htmlFile, buf.Bytes(), 0750); err != nil {
 		fmt.Printf("Couldn't write index.html %s: %+v", htmlFile, err)
@@ -179,7 +256,7 @@ func writeHtml(album Album, subAlbums []Album, images []Image, outputDir string)
 }
 
 // createAlbum recursively walks intputDir, outputs images + HTML in outputDir.
-// Returns true if it created any output.
+// The returned Album has a summary of the work done.
 func createAlbum(inputDir string, outputDir string) Album {
 	result := Album{Name: filepath.Base(inputDir), MinTime: FutureTime, MaxTime: PastTime}
 	entries, err := os.ReadDir(inputDir)
@@ -226,6 +303,19 @@ func createAlbum(inputDir string, outputDir string) Album {
 		}
 	}
 	result.NumImages += len(images)
+	slices.SortFunc(images, func(a, b Image) int {
+		if n := a.DateTime.Compare(b.DateTime); n != 0 {
+			return n
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+	slices.SortFunc(subAlbums, func(a, b Album) int {
+		if n := a.MinTime.Compare(b.MinTime); n != 0 {
+			return n
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+
 	writeHtml(result, subAlbums, images, outputDir)
 	return result
 }
